@@ -1,0 +1,3 @@
+[target.arm-unknown-linux-gnueabi]
+image = "cross/debian-arm-unknown-linux-gnueabi:latest"
+

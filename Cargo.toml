@@ -3,10 +3,10 @@ name = "pizero-gadget-gamepads"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 anyhow = "1.0.71"
 env_logger = "0.10.0"
 log = "0.4.17"
-usbd-hid = "0.6.1"
+gilrs = "0.10.2"
+signal-hook = "0.3.15"
+scroll = { version = "0.11.0", features = ["derive"] }

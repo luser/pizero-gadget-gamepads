@@ -1,0 +1,2 @@
+05000000791d00000900000000010000,NYKO PLAYPAD PRO,platform:Linux,a:b0,b:b1,x:b3,y:b4,start:b11,leftstick:b13,rightstick:b14,leftshoulder:b6,rightshoulder:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a5,righttrigger:a4,
+05000000050b00000045000031000000,ASUS Gamepad,platform:Linux,a:b0,b:b1,x:b2,y:b3,back:b9,guide:b6,start:b10,leftstick:b7,rightstick:b8,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a5,righttrigger:a4,

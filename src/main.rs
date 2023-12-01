@@ -1,154 +1,165 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use env_logger::Builder;
-use log::{info, LevelFilter};
+use gilrs::{ev::Code, Button, Event, EventType, Gamepad, GamepadId, GilrsBuilder};
+use gilrs::{Axis, MappingSource};
+use log::{debug, error, info, log_enabled, Level, LevelFilter};
+use signal_hook::consts::signal::*;
+use signal_hook::flag as signal_flag;
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use pizero_gadget_gamepads::hid_gadget::*;
 use pizero_gadget_gamepads::hori_pokken::*;
-use std::fs;
-use std::os::unix::fs::symlink;
-use std::os::unix::prelude::OsStrExt;
-use std::path::{Path, PathBuf};
+use pizero_gadget_gamepads::HIDGamepad;
 
-const CONFIGFS_GADGET_PATH: &str = "/sys/kernel/config/usb_gadget/";
-const GADGET_NAME: &str = "gadget_gamepads";
-
-#[derive(Debug)]
-struct HIDGadgetDevice {
-    function_name: String,
-    hidg_path: String,
+struct RealGamepadToGadgetMapping<G: HIDGamepad> {
+    /// The mapping of standardized buttons to event codes for this device.
+    button_map: HashMap<Button, Code>,
+    /// The mapping of standardized axes to event codes for this device.
+    axis_map: HashMap<Axis, Code>,
+    /// The gadget device to which we're routing its data.
+    gadget_file: HIDGadgetDeviceFile<G>,
 }
 
-#[derive(Debug)]
-struct HIDGadget {
-    path: PathBuf,
-    devices: Vec<HIDGadgetDevice>,
-}
-
-impl Drop for HIDGadget {
-    fn drop(&mut self) {
-        // Empty out the UDC file to disconnect the device
-        fs::write(&self.path.join("UDC"), b"").unwrap();
-        // The ordering of these is important:
-        for device in self.devices.iter() {
-            // First, unlink the function from the config
-            fs::remove_file(&self.path.join("configs/c.1").join(&device.function_name)).unwrap();
-            // Now remove the function definition
-            fs::remove_dir(&self.path.join("functions").join(&device.function_name)).unwrap();
-        }
-        for item in &[
-            // Remove config strings
-            "configs/c.1/strings/0x409",
-            // Remove config
-            "configs/c.1",
-            // Remove gadget strings
-            "strings/0x409",
-        ] {
-            fs::remove_dir(&self.path.join(item)).unwrap()
-        }
-        // Finally, remove the entire gadget dir
-        fs::remove_dir(&self.path).unwrap()
+fn try_map_gamepad<G: HIDGamepad>(
+    gamepad: &Gamepad,
+    gadget: &mut HIDGadget<G>,
+    mappings: &mut HashMap<GamepadId, RealGamepadToGadgetMapping<G>>,
+) -> Result<()> {
+    info!("Gamepad connected: {}", gamepad.name());
+    if gamepad.mapping_source() != MappingSource::SdlMappings {
+        bail!("Not using gamepad {}, no mapping data", gamepad.name());
     }
-}
-
-fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
-    fs::write(path, contents).with_context(|| format!("Failed to write to: {path:?}"))?;
+    let gadget_file = gadget.take_device()?;
+    let mut button_map = HashMap::new();
+    use Button::*;
+    for button in [
+        South,
+        East,
+        North,
+        West,
+        // Intentionally skipping C,
+        // Intentionally skipping Z,
+        LeftTrigger,
+        LeftTrigger2,
+        RightTrigger,
+        RightTrigger2,
+        Select,
+        Start,
+        Mode,
+        LeftThumb,
+        RightThumb,
+        DPadUp,
+        DPadDown,
+        DPadLeft,
+        DPadRight,
+    ] {
+        if let Some(code) = gamepad.button_code(button) {
+            button_map.insert(button, code);
+        }
+    }
+    let mut axis_map = HashMap::new();
+    use Axis::*;
+    for axis in [LeftStickX, LeftStickY, RightStickX, RightStickY] {
+        if let Some(code) = gamepad.axis_code(axis) {
+            axis_map.insert(axis, code);
+        }
+    }
+    info!("Mapping {} to {}", gamepad.name(), gadget_file.path());
+    if log_enabled!(Level::Debug) {
+        let mut s = "  Axes:\n".to_owned();
+        for (a, c) in axis_map.iter() {
+            drop(writeln!(&mut s, "    {c} => {a:?}"));
+        }
+        drop(writeln!(&mut s, "  Buttons:"));
+        for (b, c) in button_map.iter() {
+            drop(writeln!(&mut s, "    {c} => {b:?}"));
+        }
+        debug!("Mapping:\n{s}");
+    }
+    mappings.insert(
+        gamepad.id(),
+        RealGamepadToGadgetMapping {
+            button_map,
+            axis_map,
+            gadget_file,
+        },
+    );
     Ok(())
 }
 
-fn create_gadget_function(
-    gadget_path: &Path,
-    config_path: &Path,
-    name: &str,
-    descriptor: &[u8],
-    report_size: usize,
-) -> Result<HIDGadgetDevice> {
-    let path = gadget_path.join("functions").join(name);
-    fs::create_dir_all(&path)?;
-    info!("creating gadget function: {path:?}");
-    // Populate function attributes
-    for (attr, contents) in &[
-        ("protocol", b"1".as_slice()),
-        ("subclass", b"1"),
-        ("report_length", report_size.to_string().as_bytes()),
-        ("report_desc", descriptor),
-    ] {
-        write_file(&path.join(attr), contents)?;
+fn update_gamepad<G: HIDGamepad>(
+    gamepad: &Gamepad,
+    mapping: &mut RealGamepadToGadgetMapping<G>,
+) -> Result<()> {
+    let report = G::fill_report(gamepad, &mapping.button_map, &mapping.axis_map);
+    if log_enabled!(Level::Debug) {
+        debug!("{}: {report}", gamepad.name());
     }
-    // Link the function to the config
-    let target = config_path.join(name);
-    info!("Adding symlink from function to {target:?}");
-    symlink(&path, &target)?;
-    // Read the device number out
-    let dev_num = fs::read_to_string(&path.join("dev"))?;
-    let hidg_path = if let Some((major, minor)) = dev_num.trim_end().split_once(':') {
-        if major == "239" {
-            format!("/dev/hidg{minor}")
-        } else {
-            bail!("Unsupported major device: {major}");
-        }
-    } else {
-        bail!("Bad device number?");
-    };
-    Ok(HIDGadgetDevice {
-        function_name: name.to_owned(),
-        hidg_path,
-    })
+    mapping.gadget_file.write_report(report)
 }
 
-impl HIDGadget {
-    fn create(descriptor: &[u8], report_size: usize, count: usize) -> Result<Self> {
-        let path = PathBuf::from(CONFIGFS_GADGET_PATH).join(GADGET_NAME);
-        fs::create_dir(&path)?;
-        info!("creating gadget at path: {path:?}");
-        // Populate top-level attributes
-        for (attr, contents) in &[
-            ("idVendor", b"0x0f0d"),  // Hori
-            ("idProduct", b"0x0092"), // Pokken Controller
-            ("bcdDevice", b"0x0100"), // v1.0.0
-            ("bcdUSB", b"0x0200"),    // USB 2.0
-        ] {
-            write_file(&path.join(attr), contents)?;
-        }
-        // Populate en-US strings
-        let strings = path.join("strings/0x409");
-        fs::create_dir_all(&strings)?;
-        for (attr, contents) in &[
-            ("serialnumber", b"0".as_slice()),
-            // Unsure if these need to be set exactly?
-            ("manufacturer", b"HORI CO.,LTD."),
-            ("product", b"POKKEN CONTROLLER"),
-        ] {
-            write_file(&strings.join(attr), contents)?;
-        }
-        // Create config and populate a few attributes
-        let config = path.join("configs/c.1");
-        fs::create_dir_all(&config)?;
-        write_file(&config.join("MaxPower"), b"250")?;
-        let config_strings = config.join("strings/0x409");
-        fs::create_dir_all(&config_strings)?;
-        write_file(
-            &config_strings.join("configuration"),
-            b"USB Gadget Gamepads",
-        )?;
-        // Create functions and link them to the config
-        let mut devices = vec![];
-        for i in 0..count {
-            let name = format!("hid.usb{i}");
-            let device = create_gadget_function(&path, &config, &name, descriptor, report_size)?;
-            devices.push(device);
-        }
+fn create_and_run_gamepad_gadgets<G: HIDGamepad>(term: Arc<AtomicBool>) -> Result<()> {
+    let mut gadget = HIDGadget::<HoriPokkenPad>::create(1)?;
+    info!(
+        "Created gadget '{:?}' with {} gamepads",
+        gadget.path,
+        gadget.device_count()
+    );
 
-        // Enable the gadget
-        info!("Attempting to enable gadget");
-        let udc_entries = fs::read_dir("/sys/class/udc")?.collect::<Result<Vec<_>, _>>()?;
-        let udc = if let Some(entry) = udc_entries.first() {
-            entry.file_name()
-        } else {
-            bail!("No UDC found!")
-        };
-        info!("udc: {udc:?}");
-        write_file(&path.join("UDC"), udc.as_bytes())?;
+    let mut gilrs = GilrsBuilder::new()
+        .add_mappings(include_str!("../extra-mappings.txt"))
+        .build()
+        .map_err(|e| anyhow!("Error initializing gilrs: {e}"))?;
+    let mut gamepad_mappings = HashMap::new();
 
-        Ok(HIDGadget { path, devices })
+    // Iterate over all connected gamepads
+    for (_id, gamepad) in gilrs.gamepads() {
+        if let Err(e) = try_map_gamepad(&gamepad, &mut gadget, &mut gamepad_mappings) {
+            error!("{e}");
+        }
     }
+
+    while !term.load(Ordering::Relaxed) {
+        while let Some(Event { id, event, .. }) = gilrs.next_event() {
+            match event {
+                EventType::Connected => {
+                    let gamepad = gilrs.gamepad(id);
+                    if let Err(e) = try_map_gamepad(&gamepad, &mut gadget, &mut gamepad_mappings) {
+                        error!("{e}");
+                    }
+                }
+                EventType::Disconnected => {
+                    info!("Gamepad disconnected: {id}");
+                    if let Some(RealGamepadToGadgetMapping { gadget_file, .. }) =
+                        gamepad_mappings.remove(&id)
+                    {
+                        let _ = gadget.release_device(gadget_file);
+                    }
+                }
+                EventType::Dropped => {}
+                // If the gamepad we're providing doesn't have any analog buttons then we don't need
+                // to handle ButtonChanged events, and since gilrs will generate one per press/release
+                // that would cause us to write an extra report every time.
+                EventType::ButtonChanged(_, _, _) if !G::ANALOG_BUTTONS => {}
+                _ => {
+                    let gamepad = gilrs.gamepad(id);
+                    let mapping = gamepad_mappings.get_mut(&id);
+                    if let Some(mapping) = mapping {
+                        let _ = update_gamepad(&gamepad, mapping);
+                    }
+                }
+            }
+        }
+    }
+    // Release any in-use gadgets before cleaning up for real.
+    for mapping in gamepad_mappings.into_values() {
+        let RealGamepadToGadgetMapping { gadget_file, .. } = mapping;
+        let _ = gadget.release_device(gadget_file);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -156,13 +167,11 @@ fn main() -> Result<()> {
         .filter_level(LevelFilter::Info)
         .parse_default_env()
         .init();
-    let gadget = HIDGadget::create(
-        HORI_POKKEN_PAD_DESCRIPTOR,
-        std::mem::size_of::<HoriPokkenPadReport>(),
-        4,
-    )?;
-    info!("Created gadget: {gadget:?}");
-    std::thread::sleep(std::time::Duration::from_secs(10));
+    let term = Arc::new(AtomicBool::new(false));
+    signal_flag::register(SIGINT, Arc::clone(&term))?;
+    signal_flag::register(SIGTERM, Arc::clone(&term))?;
+    signal_flag::register(SIGQUIT, Arc::clone(&term))?;
+    create_and_run_gamepad_gadgets::<HoriPokkenPad>(term)?;
     info!("Shutting down");
     Ok(())
 }

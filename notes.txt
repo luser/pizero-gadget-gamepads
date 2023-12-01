@@ -1,0 +1,28 @@
+# list bluetooth controllers
+bluetoothctl list
+# show status of controller
+bluetoothctl show <addr>
+
+# put controller in a state to scan for devices: power on, discoverable, pairable
+# bluetoothctl power on
+bluetoothctl discoverable on
+bluetoothctl pairable on
+
+# Scan for devices in the background
+bluetoothctl scan on &
+
+# List devices found
+bluetoothctl devices
+
+# Pair with a device
+bluetoothctl pair <addr>
+bluetoothctl connect <addr>
+bluetoothctl trust <addr>
+
+# fg and stop the scan process
+
+bluetoothctl pairable off
+
+
+# Pro controller: https://gist.github.com/mzyy94/60ae253a45e2759451789a117c59acf9#file-add_procon_gadget-sh
+# https://github.com/mzyy94/nscon
